@@ -1,0 +1,223 @@
+name: Android Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (vMAJOR.MINOR[.PATCH]+VERSION_CODE)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve release tag
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="$REF_NAME"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
+
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Restore Debug Keystore
+        run: |
+          if [ -f debug.keystore.base64 ]; then
+            echo "Restoring debug.keystore from base64..."
+            base64 -d debug.keystore.base64 > debug.keystore
+            cp debug.keystore app/debug.keystore || true
+          fi
+
+      - name: Resolve release version
+        id: version
+        env:
+          REF_NAME: ${{ steps.release.outputs.tag }}
+        run: |
+          VERSION="${REF_NAME#v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?\+[0-9]+$ ]]; then
+            echo "Release tag must use vMAJOR.MINOR+VERSION_CODE or vMAJOR.MINOR.PATCH+VERSION_CODE, e.g. v1.0+56 or v1.0.0+56"
+            exit 1
+          fi
+
+          VERSION_NAME="${VERSION%%+*}"
+          VERSION_CODE="${VERSION##*+}"
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "Building Study OS $VERSION_NAME ($VERSION_CODE)"
+
+      - name: Run unit tests
+        run: ./gradlew testDebugUnitTest --continue
+
+      - name: Configure release signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "Configuring release keystore..."
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > app/release-key.jks
+            chmod 600 app/release-key.jks
+
+            keytool -list \
+              -keystore app/release-key.jks \
+              -storepass "$ANDROID_KEYSTORE_PASSWORD" \
+              -alias "$ANDROID_KEY_ALIAS" >/dev/null
+
+            python3 .github/scripts/configure_signing.py
+          else
+            echo "No ANDROID_KEYSTORE_BASE64 found, skipping release signing configuration."
+          fi
+
+      - name: Build release APK & AAB
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          ./gradlew -PreleaseVersionName="${{ steps.version.outputs.version_name }}" -PreleaseVersionCode="${{ steps.version.outputs.version_code }}" assembleRelease bundleRelease
+
+      - name: Verify release APK version and signing
+        env:
+          EXPECTED_VERSION_NAME: ${{ steps.version.outputs.version_name }}
+          EXPECTED_VERSION_CODE: ${{ steps.version.outputs.version_code }}
+        run: |
+          APK="app/build/outputs/apk/release/app-release.apk"
+          if [ ! -f "$APK" ]; then
+            echo "ERROR: signed release APK was not produced."
+            echo "The release will not continue with an unsigned APK."
+            exit 1
+          fi
+
+          BUILD_TOOLS_VERSION="$(ls -1 "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)"
+          AAPT2="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/aapt2"
+          BADGING="$("$AAPT2" dump badging "$APK")"
+          echo "$BADGING"
+
+          ACTUAL_VERSION_NAME="$(echo "$BADGING" | sed -n "s/.*versionName='\\([^']*\\)'.*/\\1/p" | head -n 1)"
+          ACTUAL_VERSION_CODE="$(echo "$BADGING" | sed -n "s/.*versionCode='\\([^']*\\)'.*/\\1/p" | head -n 1)"
+
+          if [ "$ACTUAL_VERSION_NAME" != "$EXPECTED_VERSION_NAME" ]; then
+            echo "ERROR: APK versionName=$ACTUAL_VERSION_NAME, expected $EXPECTED_VERSION_NAME"
+            exit 1
+          fi
+
+          if [ "$ACTUAL_VERSION_CODE" != "$EXPECTED_VERSION_CODE" ]; then
+            echo "ERROR: APK versionCode=$ACTUAL_VERSION_CODE, expected $EXPECTED_VERSION_CODE"
+            exit 1
+          fi
+
+          APKSIGNER="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/apksigner"
+          "$APKSIGNER" verify "$APK"
+
+          echo "Release APK verified: $ACTUAL_VERSION_NAME+$ACTUAL_VERSION_CODE"
+
+      - name: Stage release artifacts
+        run: |
+          mkdir -p release-artifacts
+          cp app/build/outputs/apk/release/app-release.apk release-artifacts/app-release.apk
+
+          if [ -f app/build/outputs/bundle/release/app-release.aab ]; then
+            cp app/build/outputs/bundle/release/app-release.aab release-artifacts/app-release.aab
+          fi
+
+      - name: Upload release APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: study-os-release-apk
+          path: release-artifacts/*.apk
+          if-no-files-found: warn
+
+      - name: Upload release AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: study-os-release-aab
+          path: release-artifacts/*.aab
+          if-no-files-found: warn
+
+      - name: Create GitHub release for tag
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          files: release-artifacts/*
+          generate_release_notes: true
+
+      - name: Update in-app release policy
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # The release job starts from the immutable release tag. Generate the
+          # policy from the latest main branch instead of trying to checkout main
+          # after modifying update.json on the tag checkout.
+          git fetch origin main
+          git checkout -B release-policy-main origin/main
+          python3 .github/scripts/update_release_policy.py
+
+          if git diff --quiet -- update.json; then
+            echo "Release policy already current."
+            exit 0
+          fi
+
+          git add update.json
+          git commit -m "update release policy for $RELEASE_TAG"
+
+          # main can move while a release is running. Refresh and retry instead
+          # of failing on a non-fast-forward push.
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              echo "Release policy updated on main."
+              exit 0
+            fi
+
+            echo "main moved during release; refreshing before retry $attempt..."
+            git fetch origin main
+            git reset --hard origin/main
+            python3 .github/scripts/update_release_policy.py
+            git add update.json
+
+            if git diff --cached --quiet; then
+              echo "Release policy already current after refresh."
+              exit 0
+            fi
+
+            git commit -m "update release policy for $RELEASE_TAG"
+          done
+
+          echo "ERROR: Could not update main after 3 attempts."
+          exit 1
