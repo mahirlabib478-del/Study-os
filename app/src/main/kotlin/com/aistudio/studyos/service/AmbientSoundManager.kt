@@ -1,0 +1,446 @@
+package com.aistudio.studyos.service
+
+import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioTrack
+import android.media.MediaPlayer
+import android.media.audiofx.LoudnessEnhancer
+import android.net.Uri
+import kotlin.math.PI
+import kotlin.math.sin
+import kotlin.random.Random
+
+/**
+ * 🎵 Dual-Engine Ambient Sound & Uploaded Audio Manager.
+ * Allows playing procedural background ambient noise (Rain, White Noise, Deep Focus, Forest Stream)
+ * SIMULTANEOUSLY alongside uploaded audio files (Audiobooks, study podcasts, lectures, or music).
+ * Each channel has its own independent Play/Pause toggle and Volume control.
+ */
+object AmbientSoundManager {
+    enum class Preset(val label: String) {
+        RAIN("Gentle Rain"),
+        WHITE_NOISE("White Noise"),
+        DEEP_FOCUS("Deep Focus 196Hz"),
+        FOREST_STREAM("Forest Stream"),
+        CUSTOM_AUDIO("Custom Audio")
+    }
+
+    // ==========================================
+    // 🌧️ CHANNEL 1: Procedural Ambient Sound
+    // ==========================================
+    @Volatile
+    private var track: AudioTrack? = null
+    @Volatile
+    private var worker: Thread? = null
+    @Volatile
+    private var isAmbientRunning = false
+    @Volatile
+    private var ambientVolume = 0.50f
+    @Volatile
+    private var currentPreset = Preset.RAIN
+
+    @Synchronized
+    fun isAmbientPlaying(): Boolean = isAmbientRunning
+
+    @Synchronized
+    fun getCurrentPreset(): Preset = currentPreset
+
+    @Synchronized
+    fun getAmbientVolume(): Float = ambientVolume
+
+    @Synchronized
+    fun setAmbientPreset(preset: Preset) {
+        currentPreset = preset
+    }
+
+    @Synchronized
+    fun playAmbient(preset: Preset = currentPreset, volume: Float = ambientVolume) {
+        currentPreset = preset
+        ambientVolume = volume.coerceIn(0f, 1f)
+        stopAmbient()
+
+        val sampleRate = 44_100
+        val minBuffer = AudioTrack.getMinBufferSize(
+            sampleRate,
+            AudioFormat.CHANNEL_OUT_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (minBuffer <= 0) return
+
+        val bufferSize = maxOf(minBuffer, sampleRate / 2)
+        val audioTrack = AudioTrack.Builder()
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build()
+            )
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setSampleRate(sampleRate)
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .build()
+            )
+            .setBufferSizeInBytes(bufferSize)
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .build()
+
+        if (audioTrack.state != AudioTrack.STATE_INITIALIZED) {
+            audioTrack.release()
+            return
+        }
+
+        track = audioTrack
+        isAmbientRunning = true
+        audioTrack.play()
+
+        worker = Thread({
+            val samples = ShortArray(sampleRate / 10)
+            val random = Random.Default
+            var phase = 0.0
+            var rainState = 0.0
+            while (isAmbientRunning && track === audioTrack) {
+                for (i in samples.indices) {
+                    val value = when (currentPreset) {
+                        Preset.WHITE_NOISE -> random.nextDouble(-1.0, 1.0)
+                        Preset.RAIN -> {
+                            val impulse = if (random.nextFloat() < 0.018f) random.nextDouble(-1.0, 1.0) else 0.0
+                            rainState = rainState * 0.94 + random.nextDouble(-0.18, 0.18) + impulse
+                            rainState.coerceIn(-1.0, 1.0)
+                        }
+                        Preset.DEEP_FOCUS -> sin(phase).also {
+                            phase += 2.0 * PI * 196.0 / sampleRate
+                            if (phase > 2.0 * PI) phase -= 2.0 * PI
+                        }
+                        Preset.FOREST_STREAM -> {
+                            rainState = rainState * 0.985 + random.nextDouble(-0.25, 0.25)
+                            (rainState * 0.65 + random.nextDouble(-0.08, 0.08)).coerceIn(-1.0, 1.0)
+                        }
+                        Preset.CUSTOM_AUDIO -> 0.0
+                    }
+                    samples[i] = (value * ambientVolume * Short.MAX_VALUE).toInt().coerceIn(
+                        Short.MIN_VALUE.toInt(),
+                        Short.MAX_VALUE.toInt()
+                    ).toShort()
+                }
+                if (audioTrack.write(samples, 0, samples.size) < 0) break
+            }
+        }, "StudyOS-AmbientEngine")
+        worker?.start()
+    }
+
+    @Synchronized
+    fun stopAmbient() {
+        isAmbientRunning = false
+        val oldTrack = track
+        track = null
+        worker?.interrupt()
+        worker = null
+        runCatching {
+            oldTrack?.pause()
+            oldTrack?.flush()
+            oldTrack?.release()
+        }
+    }
+
+    @Synchronized
+    fun setAmbientVolume(volume: Float) {
+        ambientVolume = volume.coerceIn(0f, 1f)
+        track?.setVolume(ambientVolume)
+    }
+
+    // ==========================================
+    // 🎧 CHANNEL 2: Uploaded Custom Audio
+    // ==========================================
+    @Volatile
+    private var mediaPlayer: MediaPlayer? = null
+    @Volatile
+    private var loudnessEnhancer: LoudnessEnhancer? = null
+    @Volatile
+    private var customAudioUri: String? = null
+    @Volatile
+    private var customAudioName: String? = null
+    @Volatile
+    private var customVolume = 0.80f
+    @Volatile
+    private var isCustomAudioPlaying = false
+    @Volatile
+    private var savedAudioPositionMs = 0
+
+    @Synchronized
+    fun isCustomAudioPlaying(): Boolean = isCustomAudioPlaying && mediaPlayer?.isPlaying == true
+
+    @Synchronized
+    fun getCustomAudioName(): String? = customAudioName
+
+    @Synchronized
+    fun getCustomAudioUri(): String? = customAudioUri
+
+    @Synchronized
+    fun getCustomAudioVolume(): Float = customVolume
+
+    @Synchronized
+    fun setCustomAudioMetadata(uri: String?, displayName: String?) {
+        if (customAudioUri != uri) {
+            savedAudioPositionMs = 0
+        }
+        customAudioUri = uri
+        customAudioName = displayName
+    }
+
+    @Synchronized
+    fun getCustomAudioCurrentPosition(): Int {
+        val mp = mediaPlayer
+        if (mp != null) {
+            return runCatching { mp.currentPosition }.getOrDefault(savedAudioPositionMs)
+        }
+        return savedAudioPositionMs
+    }
+
+    @Synchronized
+    fun getCustomAudioDuration(): Int {
+        val mp = mediaPlayer
+        if (mp != null) {
+            return runCatching { mp.duration }.getOrDefault(0).coerceAtLeast(0)
+        }
+        return 0
+    }
+
+    @Synchronized
+    fun seekCustomAudioTo(positionMs: Int) {
+        val targetPos = positionMs.coerceAtLeast(0)
+        savedAudioPositionMs = targetPos
+        val mp = mediaPlayer
+        if (mp != null) {
+            runCatching {
+                val dur = mp.duration
+                val safePos = if (dur > 0) targetPos.coerceIn(0, dur) else targetPos
+                mp.seekTo(safePos)
+            }
+        }
+    }
+
+    @Synchronized
+    fun seekCustomAudioBy(deltaMs: Int) {
+        val current = getCustomAudioCurrentPosition()
+        val duration = getCustomAudioDuration()
+        val target = if (duration > 0) {
+            (current + deltaMs).coerceIn(0, duration)
+        } else {
+            (current + deltaMs).coerceAtLeast(0)
+        }
+        seekCustomAudioTo(target)
+    }
+
+    @Synchronized
+    fun pauseCustomAudio() {
+        val mp = mediaPlayer
+        if (mp != null && isCustomAudioPlaying) {
+            runCatching {
+                savedAudioPositionMs = mp.currentPosition
+                mp.pause()
+            }
+        }
+        isCustomAudioPlaying = false
+    }
+
+    private fun applyCustomVolumeAndGain(mp: MediaPlayer?, enhancer: LoudnessEnhancer?, vol: Float) {
+        if (mp == null) return
+        val clampedVol = vol.coerceIn(0f, 2.0f)
+        val playerVol = clampedVol.coerceIn(0f, 1.0f)
+        runCatching { mp.setVolume(playerVol, playerVol) }
+
+        if (enhancer != null) {
+            runCatching {
+                if (clampedVol > 1.0f) {
+                    val boostGainMb = ((clampedVol - 1.0f) * 1200f).toInt()
+                    enhancer.setTargetGain(boostGainMb)
+                    enhancer.enabled = true
+                } else {
+                    enhancer.setTargetGain(0)
+                    enhancer.enabled = false
+                }
+            }
+        }
+    }
+
+    @Synchronized
+    fun playCustomAudio(
+        context: Context,
+        uriString: String = customAudioUri ?: "",
+        displayName: String? = customAudioName,
+        volume: Float = customVolume
+    ) {
+        if (uriString.isBlank()) return
+        val uriChanged = (customAudioUri != uriString)
+        customAudioUri = uriString
+        if (displayName != null) customAudioName = displayName
+        customVolume = volume.coerceIn(0f, 2.0f)
+
+        if (uriChanged) {
+            savedAudioPositionMs = 0
+        }
+
+        // If already playing the same URI, just adjust volume and return
+        if (!uriChanged && mediaPlayer != null && isCustomAudioPlaying) {
+            applyCustomVolumeAndGain(mediaPlayer, loudnessEnhancer, customVolume)
+            return
+        }
+
+        // If paused with existing prepared MediaPlayer on same URI, resume smoothly
+        val existingMp = mediaPlayer
+        if (!uriChanged && existingMp != null) {
+            try {
+                applyCustomVolumeAndGain(existingMp, loudnessEnhancer, customVolume)
+                if (savedAudioPositionMs > 0) {
+                    runCatching { existingMp.seekTo(savedAudioPositionMs) }
+                }
+                existingMp.start()
+                isCustomAudioPlaying = true
+                return
+            } catch (_: Exception) {
+                // If resume fails, fall through to re-init
+            }
+        }
+
+        stopCustomAudio(resetPosition = false)
+
+        var candidateMp: MediaPlayer? = null
+        var candidateEnhancer: LoudnessEnhancer? = null
+        try {
+            val mp = MediaPlayer().apply {
+                setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
+                if (uriString.startsWith("content://")) {
+                    setDataSource(context, Uri.parse(uriString))
+                } else if (uriString.startsWith("file://")) {
+                    val path = Uri.parse(uriString).path ?: uriString.removePrefix("file://")
+                    setDataSource(path)
+                } else {
+                    setDataSource(uriString)
+                }
+                isLooping = true
+                setOnErrorListener { _, _, _ ->
+                    isCustomAudioPlaying = false
+                    runCatching {
+                        loudnessEnhancer?.release()
+                    }
+                    loudnessEnhancer = null
+                    runCatching {
+                        mediaPlayer?.reset()
+                        mediaPlayer?.release()
+                    }
+                    mediaPlayer = null
+                    true
+                }
+                prepare()
+                if (savedAudioPositionMs > 0) {
+                    seekTo(savedAudioPositionMs)
+                }
+            }
+
+            val enhancer = runCatching {
+                LoudnessEnhancer(mp.audioSessionId)
+            }.getOrNull()
+
+            applyCustomVolumeAndGain(mp, enhancer, customVolume)
+            mp.start()
+
+            candidateMp = mp
+            candidateEnhancer = enhancer
+            mediaPlayer = mp
+            loudnessEnhancer = enhancer
+            isCustomAudioPlaying = true
+        } catch (e: Exception) {
+            e.printStackTrace()
+            isCustomAudioPlaying = false
+            runCatching { candidateEnhancer?.release() }
+            runCatching { candidateMp?.release() }
+        }
+    }
+
+    @Synchronized
+    fun stopCustomAudio(resetPosition: Boolean = true) {
+        val le = loudnessEnhancer
+        loudnessEnhancer = null
+        runCatching {
+            le?.enabled = false
+            le?.release()
+        }
+
+        val mp = mediaPlayer
+        if (mp != null) {
+            if (!resetPosition) {
+                runCatching { savedAudioPositionMs = mp.currentPosition }
+            } else {
+                savedAudioPositionMs = 0
+            }
+            runCatching {
+                if (mp.isPlaying) {
+                    mp.stop()
+                }
+                mp.release()
+            }
+        } else if (resetPosition) {
+            savedAudioPositionMs = 0
+        }
+        mediaPlayer = null
+        isCustomAudioPlaying = false
+    }
+
+    @Synchronized
+    fun setCustomAudioVolume(volume: Float) {
+        customVolume = volume.coerceIn(0f, 2.0f)
+        applyCustomVolumeAndGain(mediaPlayer, loudnessEnhancer, customVolume)
+    }
+
+    @Synchronized
+    fun setCustomAudio(uri: String?, displayName: String?) {
+        setCustomAudioMetadata(uri, displayName)
+    }
+
+    @Synchronized
+    fun setVolume(volume: Float) {
+        setAmbientVolume(volume)
+        setCustomAudioVolume(volume)
+    }
+
+    @Synchronized
+    fun play(
+        context: Context,
+        preset: Preset = currentPreset,
+        volume: Float = ambientVolume,
+        customUri: String? = customAudioUri
+    ) {
+        if (preset == Preset.CUSTOM_AUDIO) {
+            val uriToUse = customUri ?: customAudioUri ?: ""
+            if (uriToUse.isNotBlank()) {
+                playCustomAudio(context, uriToUse, customAudioName, customVolume)
+            }
+        } else {
+            playAmbient(preset, volume)
+        }
+    }
+
+    // ==========================================
+    // 🌐 Unified Stop & Status
+    // ==========================================
+    @Synchronized
+    fun stopAll() {
+        stopAmbient()
+        stopCustomAudio()
+    }
+
+    @Synchronized
+    fun stop() {
+        stopAll()
+    }
+
+    fun isPlaying(): Boolean = isAmbientPlaying() || isCustomAudioPlaying()
+}
